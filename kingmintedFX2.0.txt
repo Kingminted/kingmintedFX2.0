@@ -1,0 +1,805 @@
+//+------------------------------------------------------------------+
+//|                                            Enhanced KingMinted EA |
+//|                                                      Your Name    |
+//|                                                                   |
+//+------------------------------------------------------------------+
+#property copyright "Your Name"
+#property link      ""
+#property version   "2.0"
+#property strict
+
+//--- Input parameters
+input double Lots = 0.1;
+input int StopLoss = 50;
+input int TakeProfit = 100;
+input int StochasticK = 5;
+input int StochasticD = 3;
+input int StochasticSlowing = 3;
+input int SRPeriod = 20; // Support/Resistance period
+input int MaxPositionsPerPair = 4;
+input int PositionsToOpenAtOnce = 2;
+input bool EnableTrading = true;
+
+//--- Global variables
+double supportLevel = 0.0;
+double resistanceLevel = 0.0;
+int totalBuyOrders = 0;
+int totalSellOrders = 0;
+datetime lastSignalTime = 0;
+string signalStatus = "Waiting";
+datetime signalStatusTime = 0;
+
+//--- Arrays for S&R calculation
+double highs[], lows[];
+
+//--- Dashboard variables
+bool showDashboard = true;
+bool dashboardMinimized = false;
+int dashboardX = 10;
+int dashboardY = 30;
+int dashboardWidth = 300;
+int dashboardHeight = 400;
+
+//--- Button objects
+string btnBuy = "btnBuy";
+string btnSell = "btnSell";
+string btnCloseAll = "btnCloseAll";
+string btnMinimize = "btnMinimize";
+string btnToggleTrading = "btnToggleTrading";
+
+//--- Dashboard colors
+color colorBackground = C'25,25,25';
+color colorText = clrWhite;
+color colorBuy = clrGreen;
+color colorSell = clrRed;
+color colorButton = C'70,70,70';
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    // Initialize arrays
+    ArrayResize(highs, SRPeriod);
+    ArrayResize(lows, SRPeriod);
+    
+    // Create dashboard
+    CreateDashboard();
+    
+    // Print initialization message
+    Print("Enhanced KingMinted EA initialized successfully");
+    Print("Max positions per pair: ", MaxPositionsPerPair);
+    Print("Positions to open at once: ", PositionsToOpenAtOnce);
+    
+    return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    // Clean up dashboard objects
+    DeleteDashboard();
+    Print("EA deinitialized. Reason: ", reason);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+    if(!EnableTrading) return;
+    
+    // Update S&R levels
+    CalculateSupportResistance();
+    
+    // Count current positions
+    CountPositions();
+    
+    // Check for closing conditions first
+    CheckClosingConditions();
+    
+    // Check for opening conditions
+    if(totalBuyOrders + totalSellOrders < MaxPositionsPerPair)
+    {
+        CheckOpeningSignals();
+    }
+    
+    // Update display info (simplified)
+    UpdateDisplay();
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Support and Resistance levels                         |
+//+------------------------------------------------------------------+
+void CalculateSupportResistance()
+{
+    // Get recent highs and lows
+    for(int i = 0; i < SRPeriod; i++)
+    {
+        highs[i] = iHigh(Symbol(), PERIOD_CURRENT, i);
+        lows[i] = iLow(Symbol(), PERIOD_CURRENT, i);
+    }
+    
+    // Find support (lowest low in period)
+    supportLevel = ArrayMinimum(lows, WHOLE_ARRAY, 0);
+    supportLevel = lows[supportLevel];
+    
+    // Find resistance (highest high in period)
+    resistanceLevel = ArrayMaximum(highs, WHOLE_ARRAY, 0);
+    resistanceLevel = highs[resistanceLevel];
+}
+
+//+------------------------------------------------------------------+
+//| Count current positions by type                                 |
+//+------------------------------------------------------------------+
+void CountPositions()
+{
+    totalBuyOrders = 0;
+    totalSellOrders = 0;
+    
+    for(int i = 0; i < OrdersTotal(); i++)
+    {
+        if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+        {
+            if(OrderSymbol() == Symbol())
+            {
+                if(OrderType() == OP_BUY) totalBuyOrders++;
+                if(OrderType() == OP_SELL) totalSellOrders++;
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check closing conditions based on Stochastic                    |
+//+------------------------------------------------------------------+
+void CheckClosingConditions()
+{
+    double stochMain = iStochastic(Symbol(), PERIOD_CURRENT, StochasticK, StochasticD, StochasticSlowing, MODE_SMA, 0, MODE_MAIN, 0);
+    double stochMainPrev = iStochastic(Symbol(), PERIOD_CURRENT, StochasticK, StochasticD, StochasticSlowing, MODE_SMA, 0, MODE_MAIN, 1);
+    
+    // Close BUY orders if Stochastic crosses down below 75
+    if(stochMainPrev >= 75.0 && stochMain < 75.0)
+    {
+        CloseOrdersByType(OP_BUY);
+        UpdateSignalStatus("BUY orders closed - Stochastic below 75");
+    }
+    
+    // Close SELL orders if Stochastic crosses up above 25
+    if(stochMainPrev <= 25.0 && stochMain > 25.0)
+    {
+        CloseOrdersByType(OP_SELL);
+        UpdateSignalStatus("SELL orders closed - Stochastic above 25");
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Close orders by type                                            |
+//+------------------------------------------------------------------+
+void CloseOrdersByType(int orderType)
+{
+    for(int i = OrdersTotal() - 1; i >= 0; i--)
+    {
+        if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+        {
+            if(OrderSymbol() == Symbol() && OrderType() == orderType)
+            {
+                bool result = OrderClose(OrderTicket(), OrderLots(), 
+                    orderType == OP_BUY ? Bid : Ask, 3, clrRed);
+                
+                if(result)
+                {
+                    Print("Closed ", orderType == OP_BUY ? "BUY" : "SELL", 
+                          " order #", OrderTicket(), " due to Stochastic signal");
+                }
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check for opening signals with candlestick confirmation         |
+//+------------------------------------------------------------------+
+void CheckOpeningSignals()
+{
+    double stochMain = iStochastic(Symbol(), PERIOD_CURRENT, StochasticK, StochasticD, StochasticSlowing, MODE_SMA, 0, MODE_MAIN, 0);
+    double stochSignal = iStochastic(Symbol(), PERIOD_CURRENT, StochasticK, StochasticD, StochasticSlowing, MODE_SMA, 0, MODE_SIGNAL, 0);
+    
+    // Get candlestick confirmation
+    bool bullishCandle = IsBullishCandleConfirmation();
+    bool bearishCandle = IsBearishCandleConfirmation();
+    
+    // BUY signal: Stochastic oversold + crossing up + bullish candlestick confirmation
+    if(stochMain < 30.0 && stochMain > stochSignal && bullishCandle && totalBuyOrders < MaxPositionsPerPair/2)
+    {
+        if(TimeCurrent() - lastSignalTime > 60) // Prevent multiple signals within 1 minute
+        {
+            OpenMultipleOrders(OP_BUY);
+            UpdateSignalStatus("BUY signal with candle confirmation");
+            lastSignalTime = TimeCurrent();
+        }
+    }
+    
+    // SELL signal: Stochastic overbought + crossing down + bearish candlestick confirmation
+    if(stochMain > 70.0 && stochMain < stochSignal && bearishCandle && totalSellOrders < MaxPositionsPerPair/2)
+    {
+        if(TimeCurrent() - lastSignalTime > 60) // Prevent multiple signals within 1 minute
+        {
+            OpenMultipleOrders(OP_SELL);
+            UpdateSignalStatus("SELL signal with candle confirmation");
+            lastSignalTime = TimeCurrent();
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Open multiple orders at once                                    |
+//+------------------------------------------------------------------+
+void OpenMultipleOrders(int orderType)
+{
+    int ordersToOpen = PositionsToOpenAtOnce;
+    
+    // Check if we have room for the desired number of orders
+    int currentOrders = (orderType == OP_BUY) ? totalBuyOrders : totalSellOrders;
+    int maxAllowed = MaxPositionsPerPair / 2;
+    
+    if(currentOrders + ordersToOpen > maxAllowed)
+    {
+        ordersToOpen = maxAllowed - currentOrders;
+    }
+    
+    for(int i = 0; i < ordersToOpen; i++)
+    {
+        if(orderType == OP_BUY)
+        {
+            OpenBuyOrder();
+        }
+        else
+        {
+            OpenSellOrder();
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Open BUY order with dynamic stop loss                          |
+//+------------------------------------------------------------------+
+void OpenBuyOrder()
+{
+    double price = Ask;
+    double sl = CalculateBuyStopLoss();
+    double tp = price + TakeProfit * Point;
+    
+    int ticket = OrderSend(Symbol(), OP_BUY, Lots, price, 3, sl, tp, 
+                          "KingMinted EA - BUY", 0, 0, clrGreen);
+    
+    if(ticket > 0)
+    {
+        Print("BUY order opened: #", ticket, " Price: ", price, " SL: ", sl, " TP: ", tp);
+    }
+    else
+    {
+        Print("Failed to open BUY order. Error: ", GetLastError());
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Open SELL order with dynamic stop loss                         |
+//+------------------------------------------------------------------+
+void OpenSellOrder()
+{
+    double price = Bid;
+    double sl = CalculateSellStopLoss();
+    double tp = price - TakeProfit * Point;
+    
+    int ticket = OrderSend(Symbol(), OP_SELL, Lots, price, 3, sl, tp, 
+                          "KingMinted EA - SELL", 0, 0, clrRed);
+    
+    if(ticket > 0)
+    {
+        Print("SELL order opened: #", ticket, " Price: ", price, " SL: ", sl, " TP: ", tp);
+    }
+    else
+    {
+        Print("Failed to open SELL order. Error: ", GetLastError());
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate dynamic stop loss for BUY orders                     |
+//+------------------------------------------------------------------+
+double CalculateBuyStopLoss()
+{
+    // Place SL 1 pip below support level
+    double sl = supportLevel - (1 * Point);
+    
+    // Ensure minimum distance from current price
+    double minSL = Ask - StopLoss * Point;
+    
+    if(sl > minSL)
+    {
+        sl = minSL; // Use traditional SL if support is too close
+    }
+    
+    return NormalizeDouble(sl, Digits);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate dynamic stop loss for SELL orders                    |
+//+------------------------------------------------------------------+
+double CalculateSellStopLoss()
+{
+    // Place SL 1 pip above resistance level
+    double sl = resistanceLevel + (1 * Point);
+    
+    // Ensure minimum distance from current price
+    double maxSL = Bid + StopLoss * Point;
+    
+    if(sl < maxSL)
+    {
+        sl = maxSL; // Use traditional SL if resistance is too close
+    }
+    
+    return NormalizeDouble(sl, Digits);
+}
+
+//+------------------------------------------------------------------+
+//| Check for bullish candlestick confirmation                     |
+//+------------------------------------------------------------------+
+bool IsBullishCandleConfirmation()
+{
+    // Get current and previous candle data
+    double open0 = iOpen(Symbol(), PERIOD_CURRENT, 0);
+    double close0 = iClose(Symbol(), PERIOD_CURRENT, 0);
+    double high0 = iHigh(Symbol(), PERIOD_CURRENT, 0);
+    double low0 = iLow(Symbol(), PERIOD_CURRENT, 0);
+    
+    double open1 = iOpen(Symbol(), PERIOD_CURRENT, 1);
+    double close1 = iClose(Symbol(), PERIOD_CURRENT, 1);
+    double high1 = iHigh(Symbol(), PERIOD_CURRENT, 1);
+    double low1 = iLow(Symbol(), PERIOD_CURRENT, 1);
+    
+    // Current candle is bullish
+    bool currentBullish = close0 > open0;
+    
+    // Check for bullish patterns
+    bool hammer = IsBullishHammer(open1, close1, high1, low1);
+    bool engulfing = IsBullishEngulfing(open0, close0, open1, close1);
+    bool doji = IsBullishDoji(open1, close1, high1, low1);
+    
+    // Price is above previous low (basic confirmation)
+    bool priceConfirmation = close0 > low1;
+    
+    return (currentBullish || hammer || engulfing || doji) && priceConfirmation;
+}
+
+//+------------------------------------------------------------------+
+//| Check for bearish candlestick confirmation                     |
+//+------------------------------------------------------------------+
+bool IsBearishCandleConfirmation()
+{
+    // Get current and previous candle data
+    double open0 = iOpen(Symbol(), PERIOD_CURRENT, 0);
+    double close0 = iClose(Symbol(), PERIOD_CURRENT, 0);
+    double high0 = iHigh(Symbol(), PERIOD_CURRENT, 0);
+    double low0 = iLow(Symbol(), PERIOD_CURRENT, 0);
+    
+    double open1 = iOpen(Symbol(), PERIOD_CURRENT, 1);
+    double close1 = iClose(Symbol(), PERIOD_CURRENT, 1);
+    double high1 = iHigh(Symbol(), PERIOD_CURRENT, 1);
+    double low1 = iLow(Symbol(), PERIOD_CURRENT, 1);
+    
+    // Current candle is bearish
+    bool currentBearish = close0 < open0;
+    
+    // Check for bearish patterns
+    bool shootingStar = IsBearishShootingStar(open1, close1, high1, low1);
+    bool engulfing = IsBearishEngulfing(open0, close0, open1, close1);
+    bool doji = IsBearishDoji(open1, close1, high1, low1);
+    
+    // Price is below previous high (basic confirmation)
+    bool priceConfirmation = close0 < high1;
+    
+    return (currentBearish || shootingStar || engulfing || doji) && priceConfirmation;
+}
+
+//+------------------------------------------------------------------+
+//| Check for bullish hammer pattern                               |
+//+------------------------------------------------------------------+
+bool IsBullishHammer(double open, double close, double high, double low)
+{
+    double body = MathAbs(close - open);
+    double lowerShadow = MathMin(open, close) - low;
+    double upperShadow = high - MathMax(open, close);
+    double range = high - low;
+    
+    return (lowerShadow > body * 2) && (upperShadow < body * 0.5) && (range > 10 * Point);
+}
+
+//+------------------------------------------------------------------+
+//| Check for bearish shooting star pattern                        |
+//+------------------------------------------------------------------+
+bool IsBearishShootingStar(double open, double close, double high, double low)
+{
+    double body = MathAbs(close - open);
+    double lowerShadow = MathMin(open, close) - low;
+    double upperShadow = high - MathMax(open, close);
+    double range = high - low;
+    
+    return (upperShadow > body * 2) && (lowerShadow < body * 0.5) && (range > 10 * Point);
+}
+
+//+------------------------------------------------------------------+
+//| Check for bullish engulfing pattern                            |
+//+------------------------------------------------------------------+
+bool IsBullishEngulfing(double open0, double close0, double open1, double close1)
+{
+    return (close1 < open1) && (close0 > open0) && (open0 < close1) && (close0 > open1);
+}
+
+//+------------------------------------------------------------------+
+//| Check for bearish engulfing pattern                            |
+//+------------------------------------------------------------------+
+bool IsBearishEngulfing(double open0, double close0, double open1, double close1)
+{
+    return (close1 > open1) && (close0 < open0) && (open0 > close1) && (close0 < open1);
+}
+
+//+------------------------------------------------------------------+
+//| Check for bullish doji at support                              |
+//+------------------------------------------------------------------+
+bool IsBullishDoji(double open, double close, double high, double low)
+{
+    double body = MathAbs(close - open);
+    double range = high - low;
+    
+    // Small body relative to range + near support level
+    bool isDojiCandle = (body < range * 0.1) && (range > 10 * Point);
+    bool nearSupport = MathAbs(MathMin(open, close) - supportLevel) < 20 * Point;
+    
+    return isDojiCandle && nearSupport;
+}
+
+//+------------------------------------------------------------------+
+//| Check for bearish doji at resistance                           |
+//+------------------------------------------------------------------+
+bool IsBearishDoji(double open, double close, double high, double low)
+{
+    double body = MathAbs(close - open);
+    double range = high - low;
+    
+    // Small body relative to range + near resistance level
+    bool isDojiCandle = (body < range * 0.1) && (range > 10 * Point);
+    bool nearResistance = MathAbs(MathMax(open, close) - resistanceLevel) < 20 * Point;
+    
+    return isDojiCandle && nearResistance;
+}
+void UpdateSignalStatus(string status)
+{
+    signalStatus = status;
+    signalStatusTime = TimeCurrent();
+}
+
+//+------------------------------------------------------------------+
+//| Update display information with full dashboard                  |
+//+------------------------------------------------------------------+
+void UpdateDisplay()
+{
+    if(!showDashboard) return;
+    
+    // Update dashboard content
+    UpdateDashboard();
+}
+
+//+------------------------------------------------------------------+
+//| Create dashboard interface                                       |
+//+------------------------------------------------------------------+
+void CreateDashboard()
+{
+    // Main dashboard background
+    CreateRectLabel("dashboardBG", dashboardX, dashboardY, dashboardWidth, 
+                   dashboardMinimized ? 30 : dashboardHeight, colorBackground);
+    
+    // Title bar
+    CreateTextLabel("titleLabel", dashboardX + 10, dashboardY + 8, 
+                   "KingMinted EA Dashboard", colorText, 12);
+    
+    if(!dashboardMinimized)
+    {
+        // Account information section
+        CreateTextLabel("accountTitle", dashboardX + 10, dashboardY + 35, 
+                       "=== ACCOUNT INFO ===", clrYellow, 10);
+        
+        // Trading information section  
+        CreateTextLabel("tradingTitle", dashboardX + 10, dashboardY + 120, 
+                       "=== TRADING STATUS ===", clrYellow, 10);
+        
+        // Signal information section
+        CreateTextLabel("signalTitle", dashboardX + 10, dashboardY + 200, 
+                       "=== SIGNALS ===", clrYellow, 10);
+        
+        // Control buttons
+        CreateButton(btnBuy, dashboardX + 10, dashboardY + 280, 80, 25, "BUY", colorBuy);
+        CreateButton(btnSell, dashboardX + 100, dashboardY + 280, 80, 25, "SELL", colorSell);
+        CreateButton(btnCloseAll, dashboardX + 190, dashboardY + 280, 80, 25, "CLOSE ALL", clrOrange);
+        
+        CreateButton(btnToggleTrading, dashboardX + 10, dashboardY + 315, 120, 25, 
+                    EnableTrading ? "DISABLE TRADING" : "ENABLE TRADING", 
+                    EnableTrading ? clrRed : colorBuy);
+    }
+    
+    // Minimize button (always visible)
+    CreateButton(btnMinimize, dashboardX + dashboardWidth - 30, dashboardY + 5, 20, 20, 
+                dashboardMinimized ? "+" : "-", colorButton);
+}
+
+//+------------------------------------------------------------------+
+//| Update dashboard content                                         |
+//+------------------------------------------------------------------+
+void UpdateDashboard()
+{
+    if(dashboardMinimized) return;
+    
+    // Calculate time since last signal status update in minutes
+    int minutesSinceStatus = (int)((TimeCurrent() - signalStatusTime) / 60);
+    
+    // Account information
+    UpdateTextLabel("balanceLabel", dashboardX + 10, dashboardY + 55, 
+                   "Balance: $" + DoubleToString(AccountBalance(), 2), colorText);
+    UpdateTextLabel("equityLabel", dashboardX + 10, dashboardY + 70, 
+                   "Equity: $" + DoubleToString(AccountEquity(), 2), colorText);
+    UpdateTextLabel("marginLabel", dashboardX + 10, dashboardY + 85, 
+                   "Free Margin: $" + DoubleToString(AccountFreeMargin(), 2), colorText);
+    UpdateTextLabel("profitLabel", dashboardX + 10, dashboardY + 100, 
+                   "Floating P&L: $" + DoubleToString(GetTotalProfit(), 2), 
+                   GetTotalProfit() >= 0 ? colorBuy : colorSell);
+    
+    // Trading status
+    UpdateTextLabel("statusLabel", dashboardX + 10, dashboardY + 140, 
+                   "Trading: " + (EnableTrading ? "ENABLED" : "DISABLED"), 
+                   EnableTrading ? colorBuy : colorSell);
+    UpdateTextLabel("buyOrdersLabel", dashboardX + 10, dashboardY + 155, 
+                   "BUY Orders: " + IntegerToString(totalBuyOrders) + "/" + IntegerToString(MaxPositionsPerPair/2), colorText);
+    UpdateTextLabel("sellOrdersLabel", dashboardX + 10, dashboardY + 170, 
+                   "SELL Orders: " + IntegerToString(totalSellOrders) + "/" + IntegerToString(MaxPositionsPerPair/2), colorText);
+    
+    // Signal information
+    UpdateTextLabel("signalLabel", dashboardX + 10, dashboardY + 220, 
+                   "Signal: " + signalStatus + " (" + IntegerToString(minutesSinceStatus) + "m ago)", colorText);
+    UpdateTextLabel("supportLabel", dashboardX + 10, dashboardY + 235, 
+                   "Support: " + DoubleToString(supportLevel, Digits), colorText);
+    UpdateTextLabel("resistanceLabel", dashboardX + 10, dashboardY + 250, 
+                   "Resistance: " + DoubleToString(resistanceLevel, Digits), colorText);
+    UpdateTextLabel("spreadLabel", dashboardX + 10, dashboardY + 265, 
+                   "Spread: " + DoubleToString((Ask - Bid) / Point, 1) + " pips", colorText);
+}
+
+//+------------------------------------------------------------------+
+//| Create rectangle label                                          |
+//+------------------------------------------------------------------+
+void CreateRectLabel(string name, int x, int y, int width, int height, color clr)
+{
+    ObjectDelete(0, name);
+    ObjectCreate(0, name, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, name, OBJPROP_XSIZE, width);
+    ObjectSetInteger(0, name, OBJPROP_YSIZE, height);
+    ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+    ObjectSetInteger(0, name, OBJPROP_BGCOLOR, clr);
+    ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+    ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_SOLID);
+    ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
+    ObjectSetInteger(0, name, OBJPROP_BACK, false);
+    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+    ObjectSetInteger(0, name, OBJPROP_SELECTED, false);
+    ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+}
+
+//+------------------------------------------------------------------+
+//| Create text label                                              |
+//+------------------------------------------------------------------+
+void CreateTextLabel(string name, int x, int y, string text, color clr, int fontSize = 8)
+{
+    ObjectDelete(0, name);
+    ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+    ObjectSetString(0, name, OBJPROP_TEXT, text);
+    ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+    ObjectSetInteger(0, name, OBJPROP_FONTSIZE, fontSize);
+    ObjectSetString(0, name, OBJPROP_FONT, "Arial Bold");
+    ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    ObjectSetInteger(0, name, OBJPROP_ANCHOR, ANCHOR_LEFT_UPPER);
+    ObjectSetInteger(0, name, OBJPROP_BACK, false);
+    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+    ObjectSetInteger(0, name, OBJPROP_SELECTED, false);
+    ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+}
+
+//+------------------------------------------------------------------+
+//| Update text label                                              |
+//+------------------------------------------------------------------+
+void UpdateTextLabel(string name, int x, int y, string text, color clr)
+{
+    if(ObjectFind(0, name) < 0)
+        CreateTextLabel(name, x, y, text, clr);
+    else
+    {
+        ObjectSetString(0, name, OBJPROP_TEXT, text);
+        ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Create button                                                   |
+//+------------------------------------------------------------------+
+void CreateButton(string name, int x, int y, int width, int height, string text, color clr)
+{
+    ObjectDelete(0, name);
+    ObjectCreate(0, name, OBJ_BUTTON, 0, 0, 0);
+    ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, name, OBJPROP_XSIZE, width);
+    ObjectSetInteger(0, name, OBJPROP_YSIZE, height);
+    ObjectSetString(0, name, OBJPROP_TEXT, text);
+    ObjectSetInteger(0, name, OBJPROP_COLOR, colorText);
+    ObjectSetInteger(0, name, OBJPROP_BGCOLOR, clr);
+    ObjectSetInteger(0, name, OBJPROP_BORDER_COLOR, clrWhite);
+    ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 8);
+    ObjectSetString(0, name, OBJPROP_FONT, "Arial Bold");
+    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+    ObjectSetInteger(0, name, OBJPROP_SELECTED, false);
+    ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+}
+
+//+------------------------------------------------------------------+
+//| Delete dashboard objects                                        |
+//+------------------------------------------------------------------+
+void DeleteDashboard()
+{
+    ObjectDelete(0, "dashboardBG");
+    ObjectDelete(0, "titleLabel");
+    ObjectDelete(0, "accountTitle");
+    ObjectDelete(0, "tradingTitle");
+    ObjectDelete(0, "signalTitle");
+    ObjectDelete(0, "balanceLabel");
+    ObjectDelete(0, "equityLabel");
+    ObjectDelete(0, "marginLabel");
+    ObjectDelete(0, "profitLabel");
+    ObjectDelete(0, "statusLabel");
+    ObjectDelete(0, "buyOrdersLabel");
+    ObjectDelete(0, "sellOrdersLabel");
+    ObjectDelete(0, "signalLabel");
+    ObjectDelete(0, "supportLabel");
+    ObjectDelete(0, "resistanceLabel");
+    ObjectDelete(0, "spreadLabel");
+    ObjectDelete(0, btnBuy);
+    ObjectDelete(0, btnSell);
+    ObjectDelete(0, btnCloseAll);
+    ObjectDelete(0, btnMinimize);
+    ObjectDelete(0, btnToggleTrading);
+}
+
+//+------------------------------------------------------------------+
+//| Get total floating profit                                       |
+//+------------------------------------------------------------------+
+double GetTotalProfit()
+{
+    double totalProfit = 0.0;
+    for(int i = 0; i < OrdersTotal(); i++)
+    {
+        if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+        {
+            if(OrderSymbol() == Symbol())
+            {
+                totalProfit += OrderProfit() + OrderSwap() + OrderCommission();
+            }
+        }
+    }
+    return totalProfit;
+}
+
+//+------------------------------------------------------------------+
+//| Handle chart events with dashboard interaction                  |
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+{
+    if(id == CHARTEVENT_OBJECT_CLICK)
+    {
+        // Handle button clicks
+        if(sparam == btnBuy)
+        {
+            if(totalBuyOrders < MaxPositionsPerPair/2)
+            {
+                OpenMultipleOrders(OP_BUY);
+                UpdateSignalStatus("Manual BUY executed");
+            }
+            ObjectSetInteger(0, btnBuy, OBJPROP_STATE, false);
+        }
+        else if(sparam == btnSell)
+        {
+            if(totalSellOrders < MaxPositionsPerPair/2)
+            {
+                OpenMultipleOrders(OP_SELL);
+                UpdateSignalStatus("Manual SELL executed");
+            }
+            ObjectSetInteger(0, btnSell, OBJPROP_STATE, false);
+        }
+        else if(sparam == btnCloseAll)
+        {
+            CloseAllOrders();
+            UpdateSignalStatus("All orders closed manually");
+            ObjectSetInteger(0, btnCloseAll, OBJPROP_STATE, false);
+        }
+        else if(sparam == btnMinimize)
+        {
+            dashboardMinimized = !dashboardMinimized;
+            DeleteDashboard();
+            CreateDashboard();
+            ObjectSetInteger(0, btnMinimize, OBJPROP_STATE, false);
+        }
+        else if(sparam == btnToggleTrading)
+        {
+            EnableTrading = !EnableTrading;
+            UpdateSignalStatus(EnableTrading ? "Trading ENABLED" : "Trading DISABLED");
+            
+            // Update button text and color
+            ObjectSetString(0, btnToggleTrading, OBJPROP_TEXT, EnableTrading ? "DISABLE TRADING" : "ENABLE TRADING");
+            ObjectSetInteger(0, btnToggleTrading, OBJPROP_BGCOLOR, EnableTrading ? clrRed : colorBuy);
+            ObjectSetInteger(0, btnToggleTrading, OBJPROP_STATE, false);
+        }
+    }
+    
+    // Keep keyboard shortcuts
+    if(id == CHARTEVENT_KEYDOWN)
+    {
+        if(lparam == 32) // Spacebar to toggle trading
+        {
+            EnableTrading = !EnableTrading;
+            UpdateSignalStatus(EnableTrading ? "Trading ENABLED (keyboard)" : "Trading DISABLED (keyboard)");
+            
+            // Update button if dashboard is visible
+            if(showDashboard && !dashboardMinimized)
+            {
+                ObjectSetString(0, btnToggleTrading, OBJPROP_TEXT, EnableTrading ? "DISABLE TRADING" : "ENABLE TRADING");
+                ObjectSetInteger(0, btnToggleTrading, OBJPROP_BGCOLOR, EnableTrading ? clrRed : colorBuy);
+            }
+        }
+        else if(lparam == 72) // 'H' key to hide/show dashboard
+        {
+            showDashboard = !showDashboard;
+            if(showDashboard)
+                CreateDashboard();
+            else
+                DeleteDashboard();
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Close all orders                                               |
+//+------------------------------------------------------------------+
+void CloseAllOrders()
+{
+    for(int i = OrdersTotal() - 1; i >= 0; i--)
+    {
+        if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+        {
+            if(OrderSymbol() == Symbol())
+            {
+                bool result = OrderClose(OrderTicket(), OrderLots(), 
+                    OrderType() == OP_BUY ? Bid : Ask, 3, clrYellow);
+                
+                if(result)
+                {
+                    Print("Manually closed order #", OrderTicket());
+                }
+            }
+        }
+    }
+}
