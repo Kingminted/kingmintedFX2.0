@@ -1,0 +1,766 @@
+//+------------------------------------------------------------------+
+//| Advanced Stochastic Trading EA |
+//| Copyright 2025, MetaQuotes Ltd. |
+//| https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025, MetaQuotes Ltd."
+#property link "https://www.mql5.com"
+#property version "1.00"
+#property strict
+#include <Trade\Trade.mqh>
+#include <Indicators\Indicators.mqh>
+//--- Input parameters
+input group "=== Trading Settings ==="
+input bool EA_Enabled = true;
+input double LotSize = 0.01;
+input int MaxPositionsPerPair = 4;
+input int MaxOpenPositions = 2; // Max simultaneous open positions
+input double RiskPercent = 0.1;
+input double MaxDrawdownPercent = 30.0;
+input group "=== Stochastic Settings ==="
+input int Stoch_K = 5;
+input int Stoch_D = 3;
+input int Stoch_Slowing = 3;
+input ENUM_MA_METHOD Stoch_Method = MODE_SMA;
+input ENUM_STO_PRICE Stoch_Price = STO_LOWHIGH;
+input group "=== Other Indicators ==="
+input int MA200_Period = 200;
+input int ATR_Period = 14;
+input int SR_Period = 20; // Support/Resistance lookback period
+input group "=== Risk Management ==="
+input int BreakevenPips = 25; // Move to breakeven at 25 pips
+input int TrailingStopPips = 25;
+input int TrailingStepPips = 10;
+input group "=== Dashboard Settings ==="
+input color BackgroundColor = clrWhite;
+input color TextColor = clrBlack;
+input bool ShowDashboard = true;
+//--- Global variables
+CTrade trade;
+CIndicators indicators;
+int stoch_handle, ma200_handle, atr_handle;
+double stoch_main[], stoch_signal[], ma200[], atr[];
+bool dashboard_minimized = false;
+bool EA_working = true; // Fixed: Initialize properly
+string log_messages[];
+int total_trades = 0;
+int winning_trades = 0;
+double daily_pnl = 0;
+double total_pnl = 0;
+datetime last_signal_time = 0;
+string last_signal_type = "";
+//--- Dashboard coordinates
+int dashboard_x = 20;
+int dashboard_y = 30;
+int dashboard_width = 400;
+int dashboard_height = 650;
+//--- Position tracking per pair
+struct PairInfo {
+    string symbol;
+    int open_positions;
+    int total_positions;
+};
+PairInfo pair_info[];
+//--- Economic events (simplified - in real EA you'd use economic calendar)
+struct EconomicEvent {
+string name;
+datetime time;
+string impact; // HIGH, MEDIUM, LOW
+};
+EconomicEvent upcoming_events[] = {
+{"CPI Release", TimeCurrent() + 3600, "HIGH"},
+{"NFP Data", TimeCurrent() + 86400, "HIGH"},
+{"Interest Rate Decision", TimeCurrent() + 172800, "HIGH"}
+};
+//+------------------------------------------------------------------+
+//| Expert initialization function |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+// Initialize indicators
+stoch_handle = iStochastic(_Symbol, PERIOD_M5, Stoch_K, Stoch_D, Stoch_Slowing, Stoch_Method, Stoch_Price);
+ma200_handle = iMA(_Symbol, PERIOD_M5, MA200_Period, 0, MODE_SMA, PRICE_CLOSE);
+atr_handle = iATR(_Symbol, PERIOD_M5, ATR_Period);
+if(stoch_handle == INVALID_HANDLE || ma200_handle == INVALID_HANDLE || atr_handle == INVALID_HANDLE) {
+Print("Error creating indicators");
+return INIT_FAILED;
+}
+// Initialize arrays
+ArraySetAsSeries(stoch_main, true);
+ArraySetAsSeries(stoch_signal, true);
+ArraySetAsSeries(ma200, true);
+ArraySetAsSeries(atr, true);
+// Initialize pair tracking
+InitializePairInfo();
+// Create dashboard
+CreateDashboard();
+AddLog("EA Initialized Successfully");
+return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Initialize pair information tracking |
+//+------------------------------------------------------------------+
+void InitializePairInfo()
+{
+    ArrayResize(pair_info, 1);
+    pair_info[0].symbol = _Symbol;
+    pair_info[0].open_positions = 0;
+    pair_info[0].total_positions = 0;
+}
+
+//+------------------------------------------------------------------+
+//| Get pair info index |
+//+------------------------------------------------------------------+
+int GetPairInfoIndex(string symbol)
+{
+    for(int i = 0; i < ArraySize(pair_info); i++) {
+        if(pair_info[i].symbol == symbol) {
+            return i;
+        }
+    }
+    // Add new pair if not found
+    int new_size = ArraySize(pair_info) + 1;
+    ArrayResize(pair_info, new_size);
+    pair_info[new_size - 1].symbol = symbol;
+    pair_info[new_size - 1].open_positions = 0;
+    pair_info[new_size - 1].total_positions = 0;
+    return new_size - 1;
+}
+
+//+------------------------------------------------------------------+
+//| Update position counts |
+//+------------------------------------------------------------------+
+void UpdatePositionCounts()
+{
+    // Reset counts
+    for(int i = 0; i < ArraySize(pair_info); i++) {
+        pair_info[i].open_positions = 0;
+    }
+    
+    // Count current positions
+    for(int i = 0; i < PositionsTotal(); i++) {
+        if(PositionSelectByTicket(i)) {
+            string symbol = PositionGetString(POSITION_SYMBOL);
+            int idx = GetPairInfoIndex(symbol);
+            pair_info[idx].open_positions++;
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate lot size based on risk percentage |
+//+------------------------------------------------------------------+
+double CalculateLotSize(double stop_loss_pips)
+{
+    double account_equity = AccountInfoDouble(ACCOUNT_EQUITY);
+    double risk_amount = account_equity * RiskPercent / 100.0;
+    
+    double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    
+    // Calculate pip value
+    double pip_value = tick_value * (point / tick_size);
+    
+    // Calculate lot size
+    double lot_size = risk_amount / (stop_loss_pips * pip_value);
+    
+    // Apply lot size limits
+    double min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    double max_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    double lot_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    
+    lot_size = MathMax(lot_size, min_lot);
+    lot_size = MathMin(lot_size, max_lot);
+    
+    // Round to lot step
+    lot_size = MathRound(lot_size / lot_step) * lot_step;
+    
+    return lot_size;
+}
+
+//+------------------------------------------------------------------+
+//| Find support level |
+//+------------------------------------------------------------------+
+double FindSupportLevel(int lookback = 0)
+{
+    if(lookback == 0) lookback = SR_Period;
+    
+    double support = DBL_MAX;
+    
+    for(int i = 1; i <= lookback; i++) {
+        double low = iLow(_Symbol, PERIOD_M5, i);
+        if(low < support) {
+            support = low;
+        }
+    }
+    
+    return support;
+}
+
+//+------------------------------------------------------------------+
+//| Find resistance level |
+//+------------------------------------------------------------------+
+double FindResistanceLevel(int lookback = 0)
+{
+    if(lookback == 0) lookback = SR_Period;
+    
+    double resistance = 0;
+    
+    for(int i = 1; i <= lookback; i++) {
+        double high = iHigh(_Symbol, PERIOD_M5, i);
+        if(high > resistance) {
+            resistance = high;
+        }
+    }
+    
+    return resistance;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+// Clean up objects
+ObjectsDeleteAll(0, "Dashboard_");
+IndicatorRelease(stoch_handle);
+IndicatorRelease(ma200_handle);
+IndicatorRelease(atr_handle);
+}
+//+------------------------------------------------------------------+
+//| Expert tick function |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+if(!EA_Enabled || !EA_working) return;
+
+// Update position counts
+UpdatePositionCounts();
+
+// Check drawdown
+if(CheckMaxDrawdown()) {
+AddLog("Maximum drawdown reached - EA disabled");
+return;
+}
+// Update indicator values
+if(!UpdateIndicators()) return;
+// Check for trading signals
+CheckTradingSignals();
+// Manage open positions
+ManagePositions();
+// Update dashboard
+if(ShowDashboard) UpdateDashboard();
+}
+//+------------------------------------------------------------------+
+//| Update indicator values |
+//+------------------------------------------------------------------+
+bool UpdateIndicators()
+{
+if(CopyBuffer(stoch_handle, 0, 0, 3, stoch_main) < 3) return false;
+if(CopyBuffer(stoch_handle, 1, 0, 3, stoch_signal) < 3) return false;
+if(CopyBuffer(ma200_handle, 0, 0, 3, ma200) < 3) return false;
+if(CopyBuffer(atr_handle, 0, 0, 3, atr) < 3) return false;
+return true;
+}
+//+------------------------------------------------------------------+
+//| Check for trading signals |
+//+------------------------------------------------------------------+
+void CheckTradingSignals()
+{
+    int pair_idx = GetPairInfoIndex(_Symbol);
+    
+    // Check position limits
+    if(pair_info[pair_idx].open_positions >= MaxOpenPositions) return;
+    if(pair_info[pair_idx].total_positions >= MaxPositionsPerPair) return;
+
+// Buy signal: Stochastic oversold and crossing up
+if(stoch_main[1] < 20 && stoch_main[0] > stoch_signal[0] && stoch_main[1] <= stoch_signal[1]) {
+if(IsBullishCandle() && GetTrend() != -1) { // Not downtrend
+OpenBuyPosition();
+last_signal_time = TimeCurrent();
+last_signal_type = "BUY";
+AddLog("BUY signal triggered - Stochastic oversold crossover with bullish candle");
+}
+}
+// Sell signal: Stochastic overbought and crossing down
+if(stoch_main[1] > 80 && stoch_main[0] < stoch_signal[0] && stoch_main[1] >= stoch_signal[1]) {
+if(IsBearishCandle() && GetTrend() != 1) { // Not uptrend
+OpenSellPosition();
+last_signal_time = TimeCurrent();
+last_signal_type = "SELL";
+AddLog("SELL signal triggered - Stochastic overbought crossover with bearish candle");
+}
+}
+}
+//+------------------------------------------------------------------+
+//| Check bullish candlestick patterns |
+//+------------------------------------------------------------------+
+bool IsBullishCandle()
+{
+double open = iOpen(_Symbol, PERIOD_M5, 1);
+double close = iClose(_Symbol, PERIOD_M5, 1);
+double high = iHigh(_Symbol, PERIOD_M5, 1);
+double low = iLow(_Symbol, PERIOD_M5, 1);
+double prev_open = iOpen(_Symbol, PERIOD_M5, 2);
+double prev_close = iClose(_Symbol, PERIOD_M5, 2);
+// Hammer pattern
+double body = MathAbs(close - open);
+double lower_shadow = MathMin(open, close) - low;
+double upper_shadow = high - MathMax(open, close);
+if(lower_shadow > 2 * body && upper_shadow < body && close > open) {
+return true; // Hammer
+}
+// Bullish engulfing
+if(prev_close < prev_open && close > open && open < prev_close && close > prev_open) {
+return true; // Bullish engulfing
+}
+// Morning star (simplified)
+if(close > open && close > prev_close) {
+return true; // Simple bullish candle
+}
+return false;
+}
+//+------------------------------------------------------------------+
+//| Check bearish candlestick patterns |
+//+------------------------------------------------------------------+
+bool IsBearishCandle()
+{
+double open = iOpen(_Symbol, PERIOD_M5, 1);
+double close = iClose(_Symbol, PERIOD_M5, 1);
+double high = iHigh(_Symbol, PERIOD_M5, 1);
+double low = iLow(_Symbol, PERIOD_M5, 1);
+double prev_open = iOpen(_Symbol, PERIOD_M5, 2);
+double prev_close = iClose(_Symbol, PERIOD_M5, 2);
+// Shooting star pattern
+double body = MathAbs(close - open);
+double lower_shadow = MathMin(open, close) - low;
+double upper_shadow = high - MathMax(open, close);
+if(upper_shadow > 2 * body && lower_shadow < body && close < open) {
+return true; // Shooting star
+}
+// Bearish engulfing
+if(prev_close > prev_open && close < open && open > prev_close && close < prev_open) {
+return true; // Bearish engulfing
+}
+// Evening star (simplified)
+if(close < open && close < prev_close) {
+return true; // Simple bearish candle
+}
+return false;
+}
+//+------------------------------------------------------------------+
+//| Get market trend |
+//+------------------------------------------------------------------+
+int GetTrend()
+{
+double current_price = iClose(_Symbol, PERIOD_M5, 0);
+if(current_price > ma200[0] + atr[0] * 0.5) return 1; // Uptrend
+if(current_price < ma200[0] - atr[0] * 0.5) return -1; // Downtrend
+return 0; // Sideways
+}
+//+------------------------------------------------------------------+
+//| Open buy position |
+//+------------------------------------------------------------------+
+void OpenBuyPosition()
+{
+    double support = FindSupportLevel();
+    double sl = support - (2 * _Point * 10); // 1 pip below support
+    double current_price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    
+    // Calculate stop loss in pips
+    double sl_pips = (current_price - sl) / (_Point * 10);
+    
+    // Calculate lot size based on risk
+    double lot_size = CalculateLotSize(sl_pips);
+    
+    if(trade.Buy(lot_size, _Symbol, 0, sl, 0, "Stochastic EA Buy")) {
+        total_trades++;
+        int pair_idx = GetPairInfoIndex(_Symbol);
+        pair_info[pair_idx].total_positions++;
+        AddLog("BUY position opened - Lot: " + DoubleToString(lot_size, 2) + 
+               " SL: " + DoubleToString(sl, _Digits) + " (" + DoubleToString(sl_pips, 1) + " pips)");
+    }
+}
+//+------------------------------------------------------------------+
+//| Open sell position |
+//+------------------------------------------------------------------+
+void OpenSellPosition()
+{
+    double resistance = FindResistanceLevel();
+    double sl = resistance + (2 * _Point * 10); // 1 pip above resistance
+    double current_price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    
+    // Calculate stop loss in pips
+    double sl_pips = (sl - current_price) / (_Point * 10);
+    
+    // Calculate lot size based on risk
+    double lot_size = CalculateLotSize(sl_pips);
+    
+    if(trade.Sell(lot_size, _Symbol, 0, sl, 0, "Stochastic EA Sell")) {
+        total_trades++;
+        int pair_idx = GetPairInfoIndex(_Symbol);
+        pair_info[pair_idx].total_positions++;
+        AddLog("SELL position opened - Lot: " + DoubleToString(lot_size, 2) + 
+               " SL: " + DoubleToString(sl, _Digits) + " (" + DoubleToString(sl_pips, 1) + " pips)");
+    }
+}
+//+------------------------------------------------------------------+
+//| Manage open positions |
+//+------------------------------------------------------------------+
+void ManagePositions()
+{
+for(int i = PositionsTotal() - 1; i >= 0; i--) {
+if(!PositionSelectByTicket(i)) continue;
+if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+ulong ticket = PositionGetInteger(POSITION_TICKET);
+ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+double current_price = (type == POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+double profit_pips = 0;
+// Calculate profit in pips
+if(type == POSITION_TYPE_BUY) {
+profit_pips = (current_price - open_price) / _Point / 10;
+} else {
+profit_pips = (open_price - current_price) / _Point / 10;
+}
+        // Check exit conditions first
+        if(CheckExitCondition(type)) {
+            trade.PositionClose(ticket);
+            if(profit_pips > 0) winning_trades++;
+            AddLog("Position closed by exit condition - Profit: " + DoubleToString(profit_pips, 1) + " pips");
+            continue;
+        }
+        
+        // Breakeven management at 25 pips
+        if(profit_pips >= BreakevenPips) {
+            SetBreakeven(ticket, type, open_price);
+        }
+        
+        // Trailing stop after 25 pips
+        if(profit_pips > TrailingStopPips) {
+            SetTrailingStop(ticket, type, current_price);
+        }
+    }
+}
+//+------------------------------------------------------------------+
+//| Check exit conditions |
+//+------------------------------------------------------------------+
+bool CheckExitCondition(ENUM_POSITION_TYPE type)
+{
+if(type == POSITION_TYPE_BUY) {
+// Close buy when stochastic crosses down from above 75 with bearish candle
+if(stoch_main[0] < 75 && stoch_main[1] >= 75) {
+return true;
+}
+} else {
+// Close sell when stochastic crosses up from below 25 with bullish candle
+if(stoch_main[0] > 25 && stoch_main[1] <= 25) {
+return true;
+}
+}
+return false;
+}
+//+------------------------------------------------------------------+
+//| Set breakeven stop loss |
+//+------------------------------------------------------------------+
+void SetBreakeven(ulong ticket, ENUM_POSITION_TYPE type, double open_price)
+{
+if(!PositionSelectByTicket(ticket)) return;
+double current_sl = PositionGetDouble(POSITION_SL);
+double new_sl = open_price; // Move to breakeven (entry price)
+
+if(type == POSITION_TYPE_BUY && (current_sl == 0 || new_sl > current_sl)) {
+if(trade.PositionModify(ticket, new_sl, 0)) {
+AddLog("Breakeven set for BUY position at: " + DoubleToString(new_sl, _Digits));
+}
+} else if(type == POSITION_TYPE_SELL && (current_sl == 0 || new_sl < current_sl)) {
+if(trade.PositionModify(ticket, new_sl, 0)) {
+AddLog("Breakeven set for SELL position at: " + DoubleToString(new_sl, _Digits));
+}
+}
+}
+//+------------------------------------------------------------------+
+//| Set trailing stop |
+//+------------------------------------------------------------------+
+void SetTrailingStop(ulong ticket, ENUM_POSITION_TYPE type, double current_price)
+{
+if(!PositionSelectByTicket(ticket)) return;
+double current_sl = PositionGetDouble(POSITION_SL);
+double new_sl = 0;
+double trailing_distance = TrailingStopPips * _Point * 10;
+double trailing_step = TrailingStepPips * _Point * 10;
+
+if(type == POSITION_TYPE_BUY) {
+new_sl = current_price - trailing_distance;
+if(current_sl == 0 || new_sl > current_sl + trailing_step) {
+if(trade.PositionModify(ticket, new_sl, 0)) {
+AddLog("Trailing stop updated for BUY to: " + DoubleToString(new_sl, _Digits));
+}
+}
+} else {
+new_sl = current_price + trailing_distance;
+if(current_sl == 0 || new_sl < current_sl - trailing_step) {
+if(trade.PositionModify(ticket, new_sl, 0)) {
+AddLog("Trailing stop updated for SELL to: " + DoubleToString(new_sl, _Digits));
+}
+}
+}
+}
+//+------------------------------------------------------------------+
+//| Check maximum drawdown |
+//+------------------------------------------------------------------+
+bool CheckMaxDrawdown()
+{
+double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+double drawdown = (balance - equity) / balance * 100;
+return drawdown >= MaxDrawdownPercent;
+}
+//+------------------------------------------------------------------+
+//| Create dashboard |
+//+------------------------------------------------------------------+
+void CreateDashboard()
+{
+// Main panel
+ObjectCreate(0, "Dashboard_Panel", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+ObjectSetInteger(0, "Dashboard_Panel", OBJPROP_XDISTANCE, dashboard_x);
+ObjectSetInteger(0, "Dashboard_Panel", OBJPROP_YDISTANCE, dashboard_y);
+ObjectSetInteger(0, "Dashboard_Panel", OBJPROP_XSIZE, dashboard_width);
+ObjectSetInteger(0, "Dashboard_Panel", OBJPROP_YSIZE, dashboard_minimized ? 50 : dashboard_height);
+ObjectSetInteger(0, "Dashboard_Panel", OBJPROP_BGCOLOR, BackgroundColor);
+ObjectSetInteger(0, "Dashboard_Panel", OBJPROP_BORDER_COLOR, clrGray);
+ObjectSetInteger(0, "Dashboard_Panel", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+// Title
+ObjectCreate(0, "Dashboard_Title", OBJ_LABEL, 0, 0, 0);
+ObjectSetInteger(0, "Dashboard_Title", OBJPROP_XDISTANCE, dashboard_x + 10);
+ObjectSetInteger(0, "Dashboard_Title", OBJPROP_YDISTANCE, dashboard_y + 10);
+ObjectSetString(0, "Dashboard_Title", OBJPROP_TEXT, "Advanced Stochastic Trading EA");
+ObjectSetInteger(0, "Dashboard_Title", OBJPROP_COLOR, TextColor);
+ObjectSetInteger(0, "Dashboard_Title", OBJPROP_FONTSIZE, 12);
+ObjectSetString(0, "Dashboard_Title", OBJPROP_FONT, "Arial Bold");
+// Control buttons
+CreateButton("Dashboard_OnOff", "EA: " + (EA_working ? "ON" : "OFF"),
+dashboard_x + 250, dashboard_y + 8, 60, 25, EA_working ? clrGreen : clrRed);
+CreateButton("Dashboard_MinMax", dashboard_minimized ? "+" : "-",
+dashboard_x + 320, dashboard_y + 8, 25, 25, clrGray);
+CreateButton("Dashboard_Logs", "Logs",
+dashboard_x + 350, dashboard_y + 8, 40, 25, clrBlue);
+}
+//+------------------------------------------------------------------+
+//| Create button |
+//+------------------------------------------------------------------+
+void CreateButton(string name, string text, int x, int y, int width, int height, color bg_color)
+{
+ObjectCreate(0, name, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+ObjectSetInteger(0, name, OBJPROP_XSIZE, width);
+ObjectSetInteger(0, name, OBJPROP_YSIZE, height);
+ObjectSetInteger(0, name, OBJPROP_BGCOLOR, bg_color);
+ObjectSetInteger(0, name, OBJPROP_BORDER_COLOR, clrBlack);
+ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+ObjectCreate(0, name + "_Text", OBJ_LABEL, 0, 0, 0);
+ObjectSetInteger(0, name + "_Text", OBJPROP_XDISTANCE, x + width/2 - StringLen(text)*3);
+ObjectSetInteger(0, name + "_Text", OBJPROP_YDISTANCE, y + height/2 - 6);
+ObjectSetString(0, name + "_Text", OBJPROP_TEXT, text);
+ObjectSetInteger(0, name + "_Text", OBJPROP_COLOR, clrWhite);
+ObjectSetInteger(0, name + "_Text", OBJPROP_FONTSIZE, 8);
+}
+//+------------------------------------------------------------------+
+//| Update dashboard |
+//+------------------------------------------------------------------+
+void UpdateDashboard()
+{
+if(dashboard_minimized) return;
+int y_offset = 50;
+
+// Account information
+CreateLabel("Dashboard_Balance", "Balance: " + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2),
+dashboard_x + 10, dashboard_y + y_offset);
+y_offset += 20;
+CreateLabel("Dashboard_Equity", "Equity: " + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2),
+dashboard_x + 10, dashboard_y + y_offset);
+y_offset += 20;
+double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+double drawdown = balance > 0 ? (balance - equity) / balance * 100 : 0;
+CreateLabel("Dashboard_Drawdown", "Drawdown: " + DoubleToString(drawdown, 2) + "%",
+dashboard_x + 10, dashboard_y + y_offset);
+y_offset += 20;
+
+// Position information with new limits
+int pair_idx = GetPairInfoIndex(_Symbol);
+string pos_text = "Positions: " + IntegerToString(pair_info[pair_idx].open_positions) + "/" + IntegerToString(MaxOpenPositions) +
+                  " (Total: " + IntegerToString(pair_info[pair_idx].total_positions) + "/" + IntegerToString(MaxPositionsPerPair) + ")";
+CreateLabel("Dashboard_Positions", pos_text, dashboard_x + 10, dashboard_y + y_offset);
+y_offset += 20;
+
+// Risk information
+CreateLabel("Dashboard_Risk", "Risk per trade: " + DoubleToString(RiskPercent, 1) + "%",
+dashboard_x + 10, dashboard_y + y_offset);
+y_offset += 30;
+
+// Technical indicators
+CreateLabel("Dashboard_StochTitle", "=== Technical Indicators ===",
+dashboard_x + 10, dashboard_y + y_offset);
+y_offset += 25;
+color stoch_color = (stoch_main[0] > 80) ? clrRed : (stoch_main[0] < 20) ? clrGreen : clrYellow;
+CreateLabel("Dashboard_Stoch", "Stochastic: " + DoubleToString(stoch_main[0], 1),
+dashboard_x + 10, dashboard_y + y_offset, stoch_color);
+y_offset += 20;
+CreateLabel("Dashboard_ATR", "ATR: " + DoubleToString(atr[0], 5),
+dashboard_x + 10, dashboard_y + y_offset);
+y_offset += 20;
+
+// Support/Resistance levels
+double support = FindSupportLevel();
+double resistance = FindResistanceLevel();
+CreateLabel("Dashboard_Support", "Support: " + DoubleToString(support, _Digits),
+dashboard_x + 10, dashboard_y + y_offset, clrBlue);
+y_offset += 20;
+CreateLabel("Dashboard_Resistance", "Resistance: " + DoubleToString(resistance, _Digits),
+dashboard_x + 10, dashboard_y + y_offset, clrRed);
+y_offset += 20;
+
+string trend_text = "Sideways";
+int trend = GetTrend();
+if(trend == 1) trend_text = "Uptrend";
+else if(trend == -1) trend_text = "Downtrend";
+CreateLabel("Dashboard_Trend", "MA200 Trend: " + trend_text,
+dashboard_x + 10, dashboard_y + y_offset);
+y_offset += 30;
+// Trading performance
+CreateLabel("Dashboard_PerfTitle", "=== Trading Performance ===",
+dashboard_x + 10, dashboard_y + y_offset);
+y_offset += 25;
+string last_signal_text = "Last Signal: " + last_signal_type;
+if(last_signal_time > 0) {
+int elapsed = (int)(TimeCurrent() - last_signal_time);
+last_signal_text += " (" + IntegerToString(elapsed) + "s ago)";
+}
+CreateLabel("Dashboard_LastSignal", last_signal_text,
+dashboard_x + 10, dashboard_y + y_offset);
+y_offset += 20;
+CreateLabel("Dashboard_TotalTrades", "Total Trades: " + IntegerToString(total_trades),
+dashboard_x + 10, dashboard_y + y_offset);
+y_offset += 20;
+double winrate = total_trades > 0 ? (double)winning_trades / total_trades * 100 : 0;
+CreateLabel("Dashboard_Winrate", "Win Rate: " + DoubleToString(winrate, 1) + "%",
+dashboard_x + 10, dashboard_y + y_offset);
+y_offset += 30;
+// Economic events
+CreateLabel("Dashboard_EconTitle", "=== Upcoming Events ===",
+dashboard_x + 10, dashboard_y + y_offset);
+y_offset += 25;
+for(int i = 0; i < ArraySize(upcoming_events) && i < 3; i++) {
+color event_color = clrBlack;
+if(upcoming_events[i].impact == "HIGH") event_color = clrRed;
+else if(upcoming_events[i].impact == "MEDIUM") event_color = clrOrange;
+else event_color = clrGreen;
+CreateLabel("Dashboard_Event" + IntegerToString(i),
+upcoming_events[i].name + " (" + upcoming_events[i].impact + ")",
+dashboard_x + 10, dashboard_y + y_offset, event_color);
+y_offset += 18;
+}
+}
+//+------------------------------------------------------------------+
+//| Create label |
+//+------------------------------------------------------------------+
+void CreateLabel(string name, string text, int x, int y, color text_color = clrBlack)
+{
+ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+ObjectSetString(0, name, OBJPROP_TEXT, text);
+ObjectSetInteger(0, name, OBJPROP_COLOR, text_color);
+ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 9);
+}
+//+------------------------------------------------------------------+
+//| Chart event handler |
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+{
+    if(id == CHARTEVENT_OBJECT_CLICK) {
+        if(sparam == "Dashboard_OnOff") {
+            EA_working = !EA_working;
+            ObjectSetString(0, "Dashboard_OnOff_Text", OBJPROP_TEXT, "EA: " + (EA_working ? "ON" : "OFF"));
+            ObjectSetInteger(0, "Dashboard_OnOff", OBJPROP_BGCOLOR, EA_working ? clrGreen : clrRed);
+            AddLog("EA " + (EA_working ? "enabled" : "disabled") + " by user");
+        }
+        else if(sparam == "Dashboard_MinMax") {
+            dashboard_minimized = !dashboard_minimized;
+            ObjectSetInteger(0, "Dashboard_Panel", OBJPROP_YSIZE, dashboard_minimized ? 50 : dashboard_height);
+            ObjectSetString(0, "Dashboard_MinMax_Text", OBJPROP_TEXT, dashboard_minimized ? "+" : "-");
+            // Hide/show dashboard elements
+            string objects[] = {"Dashboard_Balance", "Dashboard_Equity", "Dashboard_Drawdown",
+            "Dashboard_Positions", "Dashboard_Risk", "Dashboard_StochTitle", "Dashboard_Stoch",
+            "Dashboard_ATR", "Dashboard_Support", "Dashboard_Resistance", "Dashboard_Trend", 
+            "Dashboard_PerfTitle", "Dashboard_LastSignal", "Dashboard_TotalTrades", 
+            "Dashboard_Winrate", "Dashboard_EconTitle"};
+            for(int i = 0; i < ArraySize(objects); i++) {
+                ObjectSetInteger(0, objects[i], OBJPROP_TIMEFRAMES, dashboard_minimized ? OBJ_NO_PERIODS : OBJ_ALL_PERIODS);
+            }
+            // Hide event labels
+            for(int i = 0; i < 3; i++) {
+                ObjectSetInteger(0, "Dashboard_Event" + IntegerToString(i), OBJPROP_TIMEFRAMES, 
+                               dashboard_minimized ? OBJ_NO_PERIODS : OBJ_ALL_PERIODS);
+            }
+        }
+        else if(sparam == "Dashboard_Logs") {
+            ShowLogs();
+        }
+    }
+}
+//+------------------------------------------------------------------+
+//| Add log message |
+//+------------------------------------------------------------------+
+void AddLog(string message)
+{
+datetime current_time = TimeCurrent();
+string time_str = TimeToString(current_time, TIME_DATE|TIME_MINUTES);
+string full_message = time_str + ": " + message;
+ArrayResize(log_messages, ArraySize(log_messages) + 1);
+log_messages[ArraySize(log_messages) - 1] = full_message;
+// Keep only last 100 messages
+if(ArraySize(log_messages) > 100) {
+ArrayCopy(log_messages, log_messages, 0, 1);
+ArrayResize(log_messages, ArraySize(log_messages) - 1);
+}
+Print(full_message);
+}
+//+------------------------------------------------------------------+
+//| Show logs |
+//+------------------------------------------------------------------+
+void ShowLogs()
+{
+string log_text = "=== EA LOGS ===\n";
+for(int i = ArraySize(log_messages) - 1; i >= 0 && i >= ArraySize(log_messages) - 20; i--) {
+log_text += log_messages[i] + "\n";
+}
+MessageBox(log_text, "EA Logs", MB_OK);
+}
+//+------------------------------------------------------------------+
+//| Print performance report |
+//+------------------------------------------------------------------+
+void PrintPerformanceReport()
+{
+string report = "=== PERFORMANCE REPORT ===\n";
+report += "Total Trades: " + IntegerToString(total_trades) + "\n";
+report += "Winning Trades: " + IntegerToString(winning_trades) + "\n";
+report += "Win Rate: " + DoubleToString(total_trades > 0 ? (double)winning_trades/total_trades*100 : 0, 2) + "%\n";
+report += "Current Balance: " + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) + "\n";
+report += "Current Equity: " + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2) + "\n";
+double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+double current_drawdown = balance > 0 ? (balance - equity) / balance * 100 : 0;
+report += "Current Drawdown: " + DoubleToString(current_drawdown, 2) + "%\n";
+report += "Max Drawdown Limit: " + DoubleToString(MaxDrawdownPercent, 2) + "%\n";
+report += "Risk Per Trade: " + DoubleToString(RiskPercent, 2) + "%\n";
+int pair_idx = GetPairInfoIndex(_Symbol);
+report += "Current Open Positions: " + IntegerToString(pair_info[pair_idx].open_positions) + "/" + IntegerToString(MaxOpenPositions) + "\n";
+report += "Total Positions This Pair: " + IntegerToString(pair_info[pair_idx].total_positions) + "/" + IntegerToString(MaxPositionsPerPair) + "\n";
+Print(report);
+Comment(report);
+}
